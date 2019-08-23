@@ -234,6 +234,57 @@ class Raster(object):
 
         return value
 
+    def sample_polygon(self, polygon, band, invert=False):
+        """
+        Method to get an unordered list of raster values that are located
+        within a arbitrary polygon
+
+        Parameters
+        ----------
+        polygon : (shapely.geometry.Polygon or GeoJSON-like dict)
+            The values should be a GeoJSON-like dict or object
+            implements the Python geo interface protocal.
+
+            Alternatively if the user supplies the vectors
+            of a polygon in the format [(x0, y0), ..., (xn, yn)]
+            a single shapely polygon will be created for
+            cropping the data
+
+        band : int
+            raster band to re-sample
+
+        invert : bool
+            Default value is False. If invert is True then the
+            area inside the shapes will be masked out
+
+        Returns
+        -------
+            np.ndarray of unordered raster values
+
+        """
+        if band not in self.bands:
+            err = "Band number is not recognized, use self.bands for a list " \
+                  "of raster bands"
+            raise AssertionError(err)
+
+        if self._dataset is not None:
+            arr_dict, rstr_crp_meta = self._sample_rio_dataset(polygon, invert)
+
+            for b, arr in arr_dict.items():
+                for val in self.nodatavals:
+                    t = arr[arr != val]
+                    arr_dict[b] = t
+
+        else:
+            mask = self._intersection(polygon, invert)
+
+            arr_dict = {}
+            for b, arr in self.__arr_dict.items():
+                t = arr[mask]
+                arr_dict[b] = t
+
+        return arr_dict[band]
+
     def resample_to_grid(self, xc, yc, band, method="nearest"):
         """
         Method to resample the raster data to a
@@ -313,28 +364,7 @@ class Raster(object):
 
         """
         if self._dataset is not None:
-            from rasterio.mask import mask
-
-            if isinstance(polygon, list) or isinstance(polygon, np.ndarray):
-                from shapely import geometry
-                shapes = [geometry.Polygon([[x, y] for x, y in polygon])]
-
-            else:
-                shapes = [polygon]
-
-            rstr_crp, rstr_crp_affine = mask(self._dataset,
-                                             shapes,
-                                             crop=True,
-                                             invert=invert)
-
-            rstr_crp_meta = self._dataset.meta.copy()
-            rstr_crp_meta.update({"driver": "GTiff",
-                                  "height": rstr_crp.shape[1],
-                                  "width": rstr_crp.shape[2],
-                                  "transform": rstr_crp_affine})
-
-            arr_dict = {self.bands[b]: arr for b, arr in enumerate(rstr_crp)}
-
+            arr_dict, rstr_crp_meta = self._sample_rio_dataset(polygon, invert)
             self.__arr_dict = arr_dict
             self._meta = rstr_crp_meta
             self._dataset = None
@@ -343,40 +373,12 @@ class Raster(object):
 
         else:
             # crop from user supplied points using numpy
-
-            from shapely import geometry
             from affine import Affine
 
-            # step 1: check the data type in shapes
-            if isinstance(polygon, geometry.Polygon):
-                polygon = list(polygon.exterior.coords)
+            mask = self._intersection(polygon, invert)
 
-            elif isinstance(polygon, dict):
-                # geojson, get coordinates=
-                if polygon['geometry']['type'].lower() == "polygon":
-                    polygon = [[x, y] for x, y in
-                               polygon["geometry"]["coordinates"]]
-
-                else:
-                    raise TypeError("Shape type must be a polygon")
-
-            elif isinstance(polygon, np.ndarray):
-                # numpy array, change to a list
-                polygon = list(polygon)
-
-            else:
-                # this is a list of coordinates
-                pass
-
-            # step 2: create a grid of centoids
             xc = self.xcenters
             yc = self.ycenters
-
-            # step 3: do intersection
-            mask = self._point_in_polygon(xc, yc, polygon)
-            if invert:
-                mask = np.invert(mask)
-
             # step 4: find bounding box
             xba = np.copy(xc)
             yba = np.copy(yc)
@@ -440,6 +442,114 @@ class Raster(object):
                                              transform[3], transform[4], ymax)
             self.__xcenters = None
             self.__ycenters = None
+
+    def _sample_rio_dataset(self, polygon, invert):
+        """
+        Internal method to sample a rasterIO dataset using
+        rasterIO built ins
+
+        Parameters
+        ----------
+        polygon : (shapely.geometry.Polygon or GeoJSON-like dict)
+            The values should be a GeoJSON-like dict or object
+            implements the Python geo interface protocal.
+
+            Alternatively if the user supplies the vectors
+            of a polygon in the format [(x0, y0), ..., (xn, yn)]
+            a single shapely polygon will be created for
+            cropping the data
+
+        invert : bool
+            Default value is False. If invert is True then the
+            area inside the shapes will be masked out
+
+        Returns
+        -------
+            tuple : (arr_dict, raster_crp_meta)
+
+        """
+        from rasterio.mask import mask
+
+        if isinstance(polygon, list) or isinstance(polygon, np.ndarray):
+            from shapely import geometry
+            shapes = [geometry.Polygon([[x, y] for x, y in polygon])]
+
+        else:
+            shapes = [polygon]
+
+        rstr_crp, rstr_crp_affine = mask(self._dataset,
+                                         shapes,
+                                         crop=True,
+                                         invert=invert)
+
+        rstr_crp_meta = self._dataset.meta.copy()
+        rstr_crp_meta.update({"driver": "GTiff",
+                              "height": rstr_crp.shape[1],
+                              "width": rstr_crp.shape[2],
+                              "transform": rstr_crp_affine})
+
+        arr_dict = {self.bands[b]: arr for b, arr in enumerate(rstr_crp)}
+
+        return arr_dict, rstr_crp_meta
+
+    def _intersection(self, polygon, invert):
+        """
+        Internal method to create an intersection mask, used for cropping
+        arrays and sampling arrays.
+
+        Parameters
+        ----------
+        polygon : (shapely.geometry.Polygon or GeoJSON-like dict)
+            The values should be a GeoJSON-like dict or object
+            implements the Python geo interface protocal.
+
+            Alternatively if the user supplies the vectors
+            of a polygon in the format [(x0, y0), ..., (xn, yn)]
+            a single shapely polygon will be created for
+            cropping the data
+
+        invert : bool
+            Default value is False. If invert is True then the
+            area inside the shapes will be masked out
+
+        Returns
+        -------
+            mask : np.ndarray (dtype = bool)
+
+        """
+        from shapely import geometry
+
+        # step 1: check the data type in shapes
+        if isinstance(polygon, geometry.Polygon):
+            polygon = list(polygon.exterior.coords)
+
+        elif isinstance(polygon, dict):
+            # geojson, get coordinates=
+            if polygon['geometry']['type'].lower() == "polygon":
+                polygon = [[x, y] for x, y in
+                           polygon["geometry"]["coordinates"]]
+
+            else:
+                raise TypeError("Shape type must be a polygon")
+
+        elif isinstance(polygon, np.ndarray):
+            # numpy array, change to a list
+            polygon = list(polygon)
+
+        else:
+            # this is a list of coordinates
+            pass
+
+        # step 2: create a grid of centoids
+        xc = self.xcenters
+        yc = self.ycenters
+
+        # step 3: do intersection
+        mask = self._point_in_polygon(xc, yc, polygon)
+        if invert:
+            mask = np.invert(mask)
+
+        return mask
 
     def _point_in_polygon(self, xc, yc, polygon):
         """
